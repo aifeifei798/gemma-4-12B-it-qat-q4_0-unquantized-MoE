@@ -43,10 +43,23 @@ class TrueTopKGating(nn.Module):
         self.num_experts = num_experts
         self.top_k = top_k
         self.router = nn.Linear(hidden_dim, num_experts, bias=False)
+        # [STEER] 推理期操控 (训练期保持默认 T=1.0/无掩码, 数学恒等)
+        self.steer_temp = 1.0
+        self.steer_disabled = []  # 禁用的专家下标, 其logits置-inf
 
     def forward(self, x_flat):
         N, _ = x_flat.shape
         logits = self.router(x_flat)  # [N, num_experts]
+        # [STEER] 掩码 + 温度 (默认恒等; Top-2至少留1个幸存者, 全禁时退化为不禁防NaN)
+        dis = [d for d in (getattr(self, "steer_disabled", []) or [])
+               if 0 <= d < self.num_experts]
+        if dis and len(dis) < self.num_experts:
+            mask = torch.zeros_like(logits, dtype=torch.bool)
+            mask[:, dis] = True
+            logits = logits.masked_fill(mask, float("-inf"))
+        _t = float(getattr(self, "steer_temp", 1.0) or 1.0)
+        if _t != 1.0:
+            logits = logits / max(_t, 1e-3)
         # [R1] 存logits供领域监督用 (不改变返回签名, 避免破坏调用方)
         self.last_logits = logits
         probs = torch.softmax(logits.float(), dim=-1).to(logits.dtype)
@@ -132,6 +145,14 @@ class MyriadTrueRoutingLayer(nn.Module):
         # [R1] 供主循环做领域监督的logits缓存 ([N,8] / [N,16])
         self.current_macro_logits = None
         self.current_cluster_logits = None
+        # [STEER] 推理期分支开关与路由干预 (默认全开/T=1.0, 训练恒等)
+        self.steer_disable_shared = False
+        self.steer_disable_macro = False
+        self.steer_disable_micro = False
+        self.steer_disable_all = False
+        self.steer_temp = 1.0
+        self.steer_disabled_macros = []
+        self.steer_disabled_clusters = []
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -146,53 +167,87 @@ class MyriadTrueRoutingLayer(nn.Module):
 
     def forward(self, x):
         base_out = self.base_mlp(x)
-        
+        # [STEER] 纯基座: 增量置零, 与--base-only等价
+        if getattr(self, "steer_disable_all", False):
+            return base_out
+
         B, S, D = x.shape
         N = B * S
         x_flat = x.view(N, D)
 
+        # [STEER] 同步操控到子门控 (server推理期设置; 训练期默认恒等)
+        _st = float(getattr(self, "steer_temp", 1.0) or 1.0)
+        self.router_macro.steer_temp = _st
+        self.router_macro.steer_disabled = list(getattr(self, "steer_disabled_macros", []) or [])
+        self.router_cluster.steer_temp = _st
+        self.router_cluster.steer_disabled = list(getattr(self, "steer_disabled_clusters", []) or [])
+        _off_shared = bool(getattr(self, "steer_disable_shared", False))
+        _off_macro = bool(getattr(self, "steer_disable_macro", False))
+        _off_micro = bool(getattr(self, "steer_disable_micro", False))
+
         # 1. 共享主宰
-        shared_out = self.scale_shared * self.shared_lora_B(self.shared_lora_A(x_flat))
+        if _off_shared:
+            shared_out = torch.zeros(N, D, device=x_flat.device, dtype=self.shared_lora_B.weight.dtype)
+        else:
+            shared_out = self.scale_shared * self.shared_lora_B(self.shared_lora_A(x_flat))
 
         # 2. 八大天王宏观路由 (8 选 2)
-        w_macro, _, aux_macro = self.router_macro(x_flat)  # [N, 8]
-        h_macro = torch.matmul(x_flat, self.macro_lora_A)  # [N, 128]
-        h_macro_weighted = (h_macro.view(N, self.num_macro_cores, self.macro_rank) * 
-                            w_macro.unsqueeze(-1)).view(N, self.total_macro_rank)
-        macro_out = self.scale_macro * torch.matmul(h_macro_weighted, self.macro_lora_B)
+        if _off_macro:
+            macro_out = torch.zeros(N, D, device=x_flat.device, dtype=self.macro_lora_B.dtype)
+            aux_macro = 0.0
+        else:
+            w_macro, _, aux_macro = self.router_macro(x_flat)  # [N, 8]
+            h_macro = torch.matmul(x_flat, self.macro_lora_A)  # [N, 128]
+            h_macro_weighted = (h_macro.view(N, self.num_macro_cores, self.macro_rank) *
+                                w_macro.unsqueeze(-1)).view(N, self.total_macro_rank)
+            macro_out = self.scale_macro * torch.matmul(h_macro_weighted, self.macro_lora_B)
 
         # 3. 满血微专家条件独立动态路由
-        w_cluster, _, aux_cluster = self.router_cluster(x_flat)  # [N, 16]
-        # [R1] 缓存监督用logits (gating内部已存last_logits, 这里直接取, 避免重复matmul)
-        self.current_macro_logits = self.router_macro.last_logits
-        self.current_cluster_logits = self.router_cluster.last_logits
+        if _off_macro:
+            # 天王层关闭时仍需跑cluster门控取监督logits? 推理期不需要, 训练期从不关闭。
+            # 为保current_*缓存形状正确, 跑一次门控但丢弃输出 (梯度图外无开销顾虑, 推理no_grad)。
+            with torch.no_grad():
+                _, _, _ = self.router_macro(x_flat)
+        # [R1] 缓存监督用logits在下面cluster门控后统一取 (gating内部已存last_logits)
+        if _off_micro:
+            w_cluster, _, aux_cluster = self.router_cluster(x_flat)  # [N, 16]
+            self.current_macro_logits = self.router_macro.last_logits
+            self.current_cluster_logits = self.router_cluster.last_logits
+            micro_out = torch.zeros(N, D, device=x_flat.device, dtype=self.micro_lora_B.dtype)
+            aux_micro = 0.0
+        else:
+            w_cluster, _, aux_cluster = self.router_cluster(x_flat)  # [N, 16]
+            # [R1] 缓存监督用logits (gating内部已存last_logits, 这里直接取, 避免重复matmul)
+            self.current_macro_logits = self.router_macro.last_logits
+            self.current_cluster_logits = self.router_cluster.last_logits
 
-        micro_logits = self.router_micro(x_flat).view(N, self.num_clusters, self.experts_per_cluster)  # [N, 16, 16]
-        micro_probs = torch.softmax(micro_logits.float(), dim=-1).to(micro_logits.dtype)
+            micro_logits = self.router_micro(x_flat).view(N, self.num_clusters, self.experts_per_cluster)  # [N, 16, 16]
+            # [STEER] micro温度 (默认1.0恒等)
+            micro_probs = torch.softmax(micro_logits.float() / max(_st, 1e-3), dim=-1).to(micro_logits.dtype)
 
-        topk_micro_vals, topk_micro_idx = torch.topk(micro_probs, k=2, dim=-1)  # [N, 16, 2]
-        topk_micro_w = topk_micro_vals / (topk_micro_vals.sum(dim=-1, keepdim=True) + 1e-8)
+            topk_micro_vals, topk_micro_idx = torch.topk(micro_probs, k=2, dim=-1)  # [N, 16, 2]
+            topk_micro_w = topk_micro_vals / (topk_micro_vals.sum(dim=-1, keepdim=True) + 1e-8)
 
-        local_sparse_w = torch.zeros_like(micro_probs).scatter_(-1, topk_micro_idx, topk_micro_w)
-        w_joint = w_cluster.unsqueeze(-1) * local_sparse_w  # [N, 16, 16]
+            local_sparse_w = torch.zeros_like(micro_probs).scatter_(-1, topk_micro_idx, topk_micro_w)
+            w_joint = w_cluster.unsqueeze(-1) * local_sparse_w  # [N, 16, 16]
 
-        h_micro = torch.matmul(x_flat, self.micro_lora_A)  # [N, 4096]
-        # [R5] view+broadcast免repeat: 省一半临时显存, 数学等价 ((w*h)@B == w*(h@B))
-        h_micro_sparse = (
-            h_micro.view(N, self.num_clusters, self.experts_per_cluster, self.micro_rank)
-            * w_joint.unsqueeze(-1)
-        ).view(N, self.total_micro_rank)
-        micro_out = self.scale_micro * torch.matmul(h_micro_sparse, self.micro_lora_B)
+            h_micro = torch.matmul(x_flat, self.micro_lora_A)  # [N, 4096]
+            # [R5] view+broadcast免repeat: 省一半临时显存, 数学等价 ((w*h)@B == w*(h@B))
+            h_micro_sparse = (
+                h_micro.view(N, self.num_clusters, self.experts_per_cluster, self.micro_rank)
+                * w_joint.unsqueeze(-1)
+            ).view(N, self.total_micro_rank)
+            micro_out = self.scale_micro * torch.matmul(h_micro_sparse, self.micro_lora_B)
 
-        # [R4] micro aux: 每个宗门独立Switch损失再平均, 与macro/cluster同量级(均匀~1.0)
-        # 宗门c内: density_c(e)=选中次数/(N*2), p_c(e)=mean probs, aux_c=E*Σd*p; aux_micro=mean_c aux_c
-        # (注: 不能直接展平到256专家做一次Switch, 否则top2+多分布求和会把均匀值抬到8)
-        with torch.no_grad():
-            one_hot = torch.zeros(N, self.num_clusters, self.experts_per_cluster, device=x_flat.device, dtype=torch.float32)
-            one_hot.scatter_(-1, topk_micro_idx, torch.ones(N, self.num_clusters, 2, device=x_flat.device, dtype=torch.float32))
-            density_micro = one_hot.sum(dim=0) / (N * 2)  # [C, E], 每行和=1
-        p_mean_micro = micro_probs.float().mean(dim=0)  # [C, E], 每行和=1
-        aux_micro = (torch.sum(density_micro * p_mean_micro, dim=-1) * self.experts_per_cluster).mean()
+            # [R4] micro aux: 每个宗门独立Switch损失再平均, 与macro/cluster同量级(均匀~1.0)
+            # 宗门c内: density_c(e)=选中次数/(N*2), p_c(e)=mean probs, aux_c=E*Σd*p; aux_micro=mean_c aux_c
+            # (注: 不能直接展平到256专家做一次Switch, 否则top2+多分布求和会把均匀值抬到8)
+            with torch.no_grad():
+                one_hot = torch.zeros(N, self.num_clusters, self.experts_per_cluster, device=x_flat.device, dtype=torch.float32)
+                one_hot.scatter_(-1, topk_micro_idx, torch.ones(N, self.num_clusters, 2, device=x_flat.device, dtype=torch.float32))
+                density_micro = one_hot.sum(dim=0) / (N * 2)  # [C, E], 每行和=1
+            p_mean_micro = micro_probs.float().mean(dim=0)  # [C, E], 每行和=1
+            aux_micro = (torch.sum(density_micro * p_mean_micro, dim=-1) * self.experts_per_cluster).mean()
 
         self.current_aux_loss = aux_macro + aux_cluster + aux_micro
 

@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtualenv (local dev only, ~6G)
+/.venv/
+venv/
+
+# Model weights / checkpoints / caches (use external storage or Git LFS, never commit)
+*.pt
+*.pth
+*.bin
+*.safetensors
+checkpoint*.pt
+myriad_tokenized_cache_*.pt
+hard_cases_v4.jsonl
+
+# Training data (large; keep small patch files only)
+myriad_train_data_*.jsonl
+bak_v22/
+train/
+
+# Uploads & local runtime
+/tmp/
+uploads/
+*.log
+.nohup
+
+# Frontend (committed: server.py serves web/dist directly on clone)
+web/node_modules/
+
+# Screenshots: only curated images/ (no timestamped dumps)
+images/2026-*.png
+images/*.tmp.png
+
+# OS / editor
+.DS_Store
+*.swp
+*~
+.vscode/
+.idea/

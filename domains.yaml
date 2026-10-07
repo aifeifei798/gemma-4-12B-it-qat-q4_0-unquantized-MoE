@@ -1,0 +1,29 @@
+# Myriad-MoE 语义别名单源 (single source of truth)
+# 服务端启动加载 -> probe/intent 下发 -> 前端只渲染, 不许硬编码名字。
+# macro_cores: 8 天王; clusters: 16 宗门, parent 指所属天王 id。
+macro_cores:
+  - {id: 0, zh: "代码工程", en: "Code"}
+  - {id: 1, zh: "严密数学", en: "Math"}
+  - {id: 2, zh: "自然科学", en: "Science"}
+  - {id: 3, zh: "文学创意", en: "Creative_Arts"}
+  - {id: 4, zh: "商务对话", en: "Business_Dialogue"}
+  - {id: 5, zh: "逻辑思辨", en: "Logic_Philosophy"}
+  - {id: 6, zh: "严格约束", en: "Constraint_Rules"}
+  - {id: 7, zh: "中文特区", en: "Chinese_Slots"}
+clusters:
+  - {id: 0, zh: "语法算法", en: "Syntax & Algorithms", parent: 0}
+  - {id: 1, zh: "系统工程", en: "Systems Engineering", parent: 0}
+  - {id: 2, zh: "数值代数", en: "Numerical Algebra", parent: 1}
+  - {id: 3, zh: "文字推导", en: "Word Problems", parent: 1}
+  - {id: 4, zh: "基础物化", en: "Basic Physics & Chemistry", parent: 2}
+  - {id: 5, zh: "实验科学", en: "Experimental Science", parent: 2}
+  - {id: 6, zh: "长篇叙事", en: "Long-form Narrative", parent: 3}
+  - {id: 7, zh: "诗歌意象", en: "Poetry & Imagery", parent: 3}
+  - {id: 8, zh: "专业问答", en: "Expert QA", parent: 4}
+  - {id: 9, zh: "公文摘要", en: "Summarization", parent: 4}
+  - {id: 10, zh: "因果推演", en: "Causal Reasoning", parent: 5}
+  - {id: 11, zh: "哲学批判", en: "Critical Thinking", parent: 5}
+  - {id: 12, zh: "格式规范", en: "Format Compliance", parent: 6}
+  - {id: 13, zh: "负向安全", en: "Safety Refusals", parent: 6}
+  - {id: 14, zh: "中文创作", en: "Chinese Writing", parent: 7}
+  - {id: 15, zh: "中文问答", en: "Chinese QA", parent: 7}
