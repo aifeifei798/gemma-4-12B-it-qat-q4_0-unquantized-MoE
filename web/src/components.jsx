@@ -1,9 +1,10 @@
 import React from 'react'
+import { CLAN_EN, coreName } from './i18n.js'
 
 export function Bar({ label, value, max = 1, color = '#4f8cff' }) {
   return (
     <div style={{ display: 'flex', alignItems: 'center', gap: 8, margin: '2px 0' }}>
-      <div style={{ width: 110, fontSize: 12, color: '#aaa', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</div>
+      <div style={{ width: 150, fontSize: 12, color: '#aaa', whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{label}</div>
       <div style={{ flex: 1, height: 10, background: '#222', borderRadius: 4 }}>
         <div style={{ width: `${Math.min(100, (value / max) * 100)}%`, height: '100%', background: color, borderRadius: 4 }} />
       </div>
@@ -12,32 +13,33 @@ export function Bar({ label, value, max = 1, color = '#4f8cff' }) {
   )
 }
 
-export function ArchPanel({ probe, probing }) {
-  if (probing) return <div style={{ color: '#888' }}>路由探测中…（一次prefill前向）</div>
-  if (!probe) return <div style={{ color: '#666' }}>发送一条消息后，这里会显示8天王×16宗门的路由决策。</div>
+export function ArchPanel({ probe, probing, t, lang }) {
+  if (probing) return <div style={{ color: '#888' }}>{t.probing}</div>
+  if (!probe) return <div style={{ color: '#666' }}>{t.waiting}</div>
   const mMax = Math.max(...probe.macro_hist, 0.01)
   const cMax = Math.max(...probe.cluster_hist, 0.01)
+  const clanName = i => lang === 'en' ? `${i}·${CLAN_EN[i]}` : `${i}·${probe.cluster_names[i]}`;
   return (
     <div>
-      <h3>八大天王 Top1（response段聚合）</h3>
+      <h3>{t.macro}</h3>
       {probe.macro_hist.map((v, i) => (
-        <Bar key={i} label={`${i}·${probe.core_names[i]}`} value={v} max={mMax} color="#4f8cff" />
+        <Bar key={i} label={coreName(probe.core_names[i], lang, i)} value={v} max={mMax} color="#4f8cff" />
       ))}
-      <h3>十六宗门 Top1</h3>
+      <h3>{t.clan}</h3>
       {probe.cluster_hist.map((v, i) => (
-        <Bar key={i} label={`${i}·${probe.cluster_names[i]}`} value={v} max={cMax} color="#38c172" />
+        <Bar key={i} label={clanName(i)} value={v} max={cMax} color="#38c172" />
       ))}
-      <h3>三分支能量 / 基座</h3>
-      <Bar label="shared主宰" value={probe.energy.shared} max={1} color="#b18cff" />
-      <Bar label="macro天王" value={probe.energy.macro} max={1} color="#4f8cff" />
-      <Bar label="micro微核" value={probe.energy.micro} max={1} color="#38c172" />
+      <h3>{t.energy}</h3>
+      <Bar label="shared" value={probe.energy.shared} max={1} color="#b18cff" />
+      <Bar label="macro" value={probe.energy.macro} max={1} color="#4f8cff" />
+      <Bar label="micro" value={probe.energy.micro} max={1} color="#38c172" />
       {probe.domain_hit != null && (
-        <p>期望领域命中率：<b>{(probe.domain_hit * 100).toFixed(1)}%</b>
-          {probe.domain_hit > 0.3 ? '（对齐）' : '（未对齐/待训）'}</p>
+        <p>{t.hit}：<b>{(probe.domain_hit * 100).toFixed(1)}%</b>
+          {probe.domain_hit > 0.3 ? t.aligned : t.misaligned}</p>
       )}
-      <h3>LoRA分支B范数（0=没学到）</h3>
+      <h3>{t.bnorms}</h3>
       <table style={{ fontSize: 12, borderCollapse: 'collapse' }}>
-        <thead><tr><th>层</th><th>shared</th><th>macro</th><th>micro</th></tr></thead>
+        <thead><tr><th>#</th><th>shared</th><th>macro</th><th>micro</th></tr></thead>
         <tbody>
           {probe.b_norms.map(r => (
             <tr key={r.layer}><td>L{r.layer}</td><td>{r.shared.toFixed(2)}</td>
@@ -45,10 +47,10 @@ export function ArchPanel({ probe, probing }) {
           ))}
         </tbody>
       </table>
-      <h3>逐token路由（中间层，前12个response token）</h3>
-      {probe.tokens.map((t, i) => (
+      <h3>{t.tokens}</h3>
+      {probe.tokens.map((t2, i) => (
         <div key={i} style={{ fontSize: 12, fontFamily: 'monospace', color: '#ccc' }}>
-          [{i}] {JSON.stringify(t.tok)} → 天王{t.macro.map((m, k) => `${m}:${t.macro_w[k]}`).join(' ')}｜宗门{t.cluster.join(',')}
+          [{i}] {JSON.stringify(t2.tok)} → macro{t2.macro.map((m, k) => `${m}:${t2.macro_w[k]}`).join(' ')}｜clan{t2.cluster.join(',')}
         </div>
       ))}
     </div>
