@@ -6,6 +6,8 @@ micro-experts**, trained with supervised domain routing, 4-bit QLoRA-style
 adapters, and a hot-swappable patch workflow. Includes a FastAPI backend and a
 pnpm (Vite + React) chat UI with a live routing probe.
 
+> This repo contains **only the frontend**. The backend inference service and model weights (`*.pt`, see [🤗 Hugging Face](https://huggingface.co/aifeifei798/gemma-4-12B-it-qat-q4_0-unquantized-MoE)) live elsewhere and must be deployed separately.
+
 ![My Project Screenshot](https://github.com/aifeifei798/gemma-4-12B-it-qat-q4_0-unquantized-MoE/blob/main/images/2026-10-07_11-46.png)
 
 ## Architecture
