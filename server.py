@@ -70,6 +70,12 @@ STEER = {
     "disable_micro": False,
     "disable_all_moe": False,
     "max_context_tokens": 4096,
+    # [GAIN] 运行时增益 (默认1.0恒等; 0=静音, 钳0~3)
+    "gain_shared": 1.0,
+    "gain_macro": 1.0,
+    "gain_micro": 1.0,
+    "gain_cores": [1.0] * 8,
+    "gain_clusters": [1.0] * 16,
 }
 BAD_CASES = os.path.join(BASE, "hard_cases_v4.jsonl")
 
@@ -120,11 +126,20 @@ def build_prompt(history, prompt: str) -> str:
     return "".join(parts)
 
 
+def _clamp_gain(v):
+    try:
+        return min(max(float(v), 0.0), 3.0)
+    except Exception:
+        return 1.0
+
+
 def apply_steering(wrappers, st):
-    """把操控状态灌进12层wrapper (T+掩码+分支开关). 全禁时门控内退化为不禁, 防NaN."""
+    """把操控状态灌进12层wrapper (T+掩码+分支开关+增益). 全禁时门控内退化为不禁, 防NaN."""
     t = min(max(float(st.get("routing_temperature", 1.0) or 1.0), 0.05), 5.0)
     dm = sorted({int(x) for x in (st.get("disabled_macros") or []) if 0 <= int(x) < 8})
     dc = sorted({int(x) for x in (st.get("disabled_clusters") or []) if 0 <= int(x) < 16})
+    gc = ([_clamp_gain(v) for v in (st.get("gain_cores") or [])] + [1.0] * 8)[:8]
+    gu = ([_clamp_gain(v) for v in (st.get("gain_clusters") or [])] + [1.0] * 16)[:16]
     for w in wrappers:
         w.steer_temp = t
         w.steer_disabled_macros = dm
@@ -133,6 +148,11 @@ def apply_steering(wrappers, st):
         w.steer_disable_macro = bool(st.get("disable_macro", False))
         w.steer_disable_micro = bool(st.get("disable_micro", False))
         w.steer_disable_all = bool(st.get("disable_all_moe", False))
+        w.steer_gain_shared = _clamp_gain(st.get("gain_shared", 1.0))
+        w.steer_gain_macro = _clamp_gain(st.get("gain_macro", 1.0))
+        w.steer_gain_micro = _clamp_gain(st.get("gain_micro", 1.0))
+        w.steer_gain_cores = gc
+        w.steer_gain_clusters = gu
 
 
 @contextmanager
@@ -143,7 +163,9 @@ def _steer_override(over):
         return
     saved = [(w, w.steer_temp, list(w.steer_disabled_macros), list(w.steer_disabled_clusters),
               w.steer_disable_shared, w.steer_disable_macro, w.steer_disable_micro,
-              w.steer_disable_all) for w in WRAPPERS]
+              w.steer_disable_all, w.steer_gain_shared, w.steer_gain_macro,
+              w.steer_gain_micro, list(w.steer_gain_cores),
+              list(w.steer_gain_clusters)) for w in WRAPPERS]
     merged = dict(STEER)
     for k, v in over.items():
         if v is not None and k in merged:
@@ -159,7 +181,7 @@ def _steer_override(over):
         apply_steering(WRAPPERS, merged)
         yield merged
     finally:
-        for w, t, dm, dc, ds, dma, dmi, dall in saved:
+        for w, t, dm, dc, ds, dma, dmi, dall, gs, gm, gu, gc, guc in saved:
             w.steer_temp = t
             w.steer_disabled_macros = dm
             w.steer_disabled_clusters = dc
@@ -167,6 +189,11 @@ def _steer_override(over):
             w.steer_disable_macro = dma
             w.steer_disable_micro = dmi
             w.steer_disable_all = dall
+            w.steer_gain_shared = gs
+            w.steer_gain_macro = gm
+            w.steer_gain_micro = gu
+            w.steer_gain_cores = gc
+            w.steer_gain_clusters = guc
 
 
 def route_summary(prompt_ids, response_text, st=None, mm_extra=None):
@@ -201,6 +228,12 @@ def route_summary(prompt_ids, response_text, st=None, mm_extra=None):
     c1, c1n = ch.most_common(1)[0] if ch else (-1, 0)
     CN, CL = probemod.CORE_NAMES, probemod.CLUSTER_NAMES
     masks = (st.get("disabled_macros") or []) + (st.get("disabled_clusters") or [])
+    _gf = lambda v: 1.0 if v is None else float(v)
+    g_on = (abs(_gf(st.get("gain_shared", 1.0)) - 1.0) > 1e-9
+            or abs(_gf(st.get("gain_macro", 1.0)) - 1.0) > 1e-9
+            or abs(_gf(st.get("gain_micro", 1.0)) - 1.0) > 1e-9
+            or any(abs(float(x) - 1.0) > 1e-9 for x in (st.get("gain_cores") or []))
+            or any(abs(float(x) - 1.0) > 1e-9 for x in (st.get("gain_clusters") or [])))
     print(f"[路由 L18-29] 天王:{CN[m1] if m1 >= 0 else '-'} {m1n / n_tok:.0%}"
           + (f" + {CN[m2]} {m2n / n_tok:.0%}" if m2 >= 0 else "")
           + f" | 宗门:{CL[c1] if c1 >= 0 else '-'} {c1n / n_tok:.0%}"
@@ -208,6 +241,7 @@ def route_summary(prompt_ids, response_text, st=None, mm_extra=None):
           + (f" masks={masks}" if masks else "")
           + (f" | 微关" if st.get("disable_micro") else "")
           + (f" | 纯基座" if st.get("disable_all_moe") else "")
+          + (" | 增益×" if g_on else "")
           + f" | {n_tok // 12}tok", flush=True)
     return {
         "macro_top": [m1, m2],
@@ -375,6 +409,11 @@ class ChatReq(BaseModel):
     disable_micro: bool | None = None
     disable_all_moe: bool | None = None
     force_macro: int | None = None
+    gain_shared: float | None = None
+    gain_macro: float | None = None
+    gain_micro: float | None = None
+    gain_cores: list | None = None
+    gain_clusters: list | None = None
 
     @field_validator("prompt", mode="before")
     @classmethod
@@ -393,6 +432,21 @@ class ChatReq(BaseModel):
     @classmethod
     def _li(cls, v):
         return _int_list(v)
+
+    @field_validator("gain_cores", "gain_clusters", mode="before")
+    @classmethod
+    def _lf(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, (int, float, str)):
+            v = [v]
+        out = []
+        for x in (v or []):
+            try:
+                out.append(float(x))
+            except Exception:
+                pass
+        return out
 
 
 class ProbeReq(BaseModel):
@@ -504,6 +558,52 @@ def domains():
                          for i in range(16)]}
 
 
+@app.get("/api/strength")
+def strength():
+    """专家强度: B矩阵范数按天王/宗门切片 (12层平均) + 每层三分支.
+    静态容量指标 (学到多少), 不随请求变; 动态占用看探针直方图."""
+    if MODEL is None:
+        return JSONResponse({"error": "模型未就绪"}, status_code=503)
+    try:
+        import torch as _t
+        with _MODEL_LOCK, _t.no_grad():
+            n = len(WRAPPERS)
+            macro_c = [0.0] * 8
+            micro_c = [0.0] * 16
+            layers = []
+            for li, w in enumerate(WRAPPERS):
+                Bm = w.macro_lora_B.detach().float()  # [8*16, H]
+                Bu = w.micro_lora_B.detach().float()  # [16*16*16, H]
+                mc = Bm.view(8, w.macro_rank, -1).norm(dim=(1, 2)).tolist()
+                uc = Bu.view(16, w.experts_per_cluster * w.micro_rank, -1) \
+                    .norm(dim=(1, 2)).tolist()
+                for i, v in enumerate(mc):
+                    macro_c[i] += v
+                for i, v in enumerate(uc):
+                    micro_c[i] += v
+                layers.append({
+                    "layer": 18 + li,
+                    "shared": w.shared_lora_B.weight.detach().float().norm().item(),
+                    "macro": Bm.norm().item(),
+                    "micro": Bu.norm().item(),
+                })
+        macro_c = [v / n for v in macro_c]
+        micro_c = [v / n for v in micro_c]
+        CN, CE = probemod.CORE_NAMES, probemod.CORE_EN
+        CL, CLE = probemod.CLUSTER_NAMES, probemod.CLUSTER_EN
+        CP = probemod.CLUSTER_PARENT
+        return {
+            "cores": [{"id": i, "name": CN[i], "en": CE[i],
+                       "strength": round(macro_c[i], 3)} for i in range(8)],
+            "clusters": [{"id": i, "name": CL[i], "en": CLE[i],
+                          "parent": CP[i], "strength": round(micro_c[i], 3)}
+                         for i in range(16)],
+            "layers": layers,
+        }
+    except Exception as e:
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
+
+
 class SteeringReq(BaseModel):
     routing_temperature: float | None = None
     disabled_macros: list | None = None
@@ -513,11 +613,31 @@ class SteeringReq(BaseModel):
     disable_micro: bool | None = None
     disable_all_moe: bool | None = None
     max_context_tokens: int | None = None
+    gain_shared: float | None = None
+    gain_macro: float | None = None
+    gain_micro: float | None = None
+    gain_cores: list | None = None
+    gain_clusters: list | None = None
 
     @field_validator("disabled_macros", "disabled_clusters", mode="before")
     @classmethod
     def _li(cls, v):
         return _int_list(v)
+
+    @field_validator("gain_cores", "gain_clusters", mode="before")
+    @classmethod
+    def _lf(cls, v):
+        if v is None:
+            return None
+        if isinstance(v, (int, float, str)):
+            v = [v]
+        out = []
+        for x in (v or []):
+            try:
+                out.append(float(x))
+            except Exception:
+                pass
+        return out
 
 
 @app.get("/admin/steering")
@@ -538,6 +658,11 @@ def steering_set(req: SteeringReq):
             STEER[k] = sorted({int(x) for x in v if 0 <= int(x) < 16})
         elif k == "max_context_tokens":
             STEER[k] = min(max(int(v), 256), 16384)
+        elif k in ("gain_shared", "gain_macro", "gain_micro"):
+            STEER[k] = _clamp_gain(v)
+        elif k in ("gain_cores", "gain_clusters"):
+            n = 8 if k == "gain_cores" else 16
+            STEER[k] = ([_clamp_gain(x) for x in v] + [1.0] * n)[:n]
         else:
             STEER[k] = bool(v)
     if MODEL is not None:
@@ -558,7 +683,9 @@ def chat(req: ChatReq):
         over = dict(pre)
         for k in ("routing_temperature", "disabled_macros", "disabled_clusters",
                   "disable_shared", "disable_macro", "disable_micro",
-                  "disable_all_moe", "force_macro"):
+                  "disable_all_moe", "force_macro",
+                  "gain_shared", "gain_macro", "gain_micro",
+                  "gain_cores", "gain_clusters"):
             v = getattr(req, k, None)
             if v is not None:
                 over[k] = v

@@ -147,12 +147,24 @@ def diagnose_layer(w, x):
     _off_mi = _off_all or bool(getattr(w, "steer_disable_micro", False))
     _dm = getattr(w, "steer_disabled_macros", []) or []
     _dc = getattr(w, "steer_disabled_clusters", []) or []
+    # [GAIN] 与 wrapper.forward 同逻辑
+    def _g1(v):
+        try:
+            return float(v)
+        except Exception:
+            return 1.0
+    _gs = _g1(getattr(w, "steer_gain_shared", 1.0))
+    _gm = _g1(getattr(w, "steer_gain_macro", 1.0))
+    _gu = _g1(getattr(w, "steer_gain_micro", 1.0))
+    _gc = ([_g1(v) for v in (getattr(w, "steer_gain_cores", []) or [])] + [1.0] * 8)[:8]
+    _guc = ([_g1(v) for v in (getattr(w, "steer_gain_clusters", []) or [])] + [1.0] * 16)[:16]
 
     # --- L0.5 shared ---
     if _off_sh:
         shared = torch.zeros(N, D, dtype=torch.float32)
     else:
         shared = (w.scale_shared * w.shared_lora_B(w.shared_lora_A(xf))).to(torch.float32)
+    shared = shared * _gs
 
     # --- L1 macro (8选2) ---
     ml = _steer_mask(w.router_macro.router(xf).float() / _t, _dm, 8)
@@ -163,8 +175,10 @@ def diagnose_layer(w, x):
     if _off_ma:
         macro = torch.zeros(N, D, dtype=torch.float32)
     else:
+        _gct = torch.tensor(_gc, dtype=sparse_macro.dtype, device=sparse_macro.device).view(1, -1)
         h = (xf.to(w.macro_lora_A.dtype) @ w.macro_lora_A).view(N, w.num_macro_cores, w.macro_rank)
-        macro = (w.scale_macro * (h * sparse_macro.to(h.dtype).unsqueeze(-1)).view(N, -1) @ w.macro_lora_B).to(torch.float32)
+        macro = (w.scale_macro * (h * (sparse_macro * _gct).to(h.dtype).unsqueeze(-1)).view(N, -1) @ w.macro_lora_B).to(torch.float32)
+        macro = macro * _gm
 
     # --- L2 cluster (16选2) + micro (宗门内16选2) ---
     cl = _steer_mask(w.router_cluster.router(xf).float() / _t, _dc, 16)
@@ -181,9 +195,11 @@ def diagnose_layer(w, x):
         tv, ti = torch.topk(mprob, k=2, dim=-1)
         tw = tv / (tv.sum(-1, keepdim=True) + 1e-8)
         local = torch.zeros_like(mprob).scatter_(-1, ti, tw)
-        joint = wcl.unsqueeze(-1) * local
+        _gut = torch.tensor(_guc, dtype=wcl.dtype, device=wcl.device).view(1, -1, 1)
+        joint = wcl.unsqueeze(-1) * local * _gut
         hm = (xf.to(w.micro_lora_A.dtype) @ w.micro_lora_A).view(N, w.num_clusters, w.experts_per_cluster, w.micro_rank)
         micro = (w.scale_micro * (hm * joint.to(hm.dtype).unsqueeze(-1)).view(N, -1) @ w.micro_lora_B).to(torch.float32)
+        micro = micro * _gu
 
     base = base_out.to(torch.float32)
     e = lambda t: t.norm(dim=-1)  # [N]

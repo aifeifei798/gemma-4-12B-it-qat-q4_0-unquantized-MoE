@@ -1,8 +1,9 @@
 import React, { useState, useEffect, useRef } from 'react'
 import { streamChat, fetchProbe, fetchHealth, hotswap, getSteering, setSteering,
-         gpuClear, markBadcase, fetchDomains, fetchBadcases, uploadFile } from './api.js'
+         gpuClear, markBadcase, fetchDomains, fetchBadcases, uploadFile,
+         fetchStrength } from './api.js'
 import { ArchPanel, SteeringPanel, MetaBadge, Md, PerReqPanel, IntentBox,
-         BadcasePanel, GatewayPanel } from './components.jsx'
+         BadcasePanel, GatewayPanel, StrengthPanel } from './components.jsx'
 import { STR } from './i18n.js'
 import './styles.css'
 
@@ -48,6 +49,7 @@ export default function App() {
   const [cockpitTab, setCockpitTab] = useState('steer')
   const [perReq, setPerReq] = useState(PER_REQ_DEFAULT)
   const [badcases, setBadcases] = useState({ total: 0, cases: [] })
+  const [strength, setStrength] = useState(null)
   const [atts, setAtts] = useState([])  // 待发送附件 [{id, kind, name, url}]
   const fileRef = useRef(null)
   const [lang, setLang] = useState(() => localStorage.getItem('mm-lang') || 'en')
@@ -132,6 +134,14 @@ export default function App() {
       const r = await fetchBadcases(20)
       if (r.ok) setBadcases({ total: r.total, cases: r.cases })
     } catch (e) { /* ignore */ }
+  }
+
+  async function loadStrength() {
+    try {
+      const r = await fetchStrength()
+      if (r.cores) setStrength(r)
+      else setBadMsg(t.probeFail(r.error || ''))
+    } catch (e) { setBadMsg(t.probeFail(e.message)) }
   }
 
   async function markBad(i) {
@@ -368,9 +378,9 @@ export default function App() {
       <aside className={'cockpit' + (cockpit ? '' : ' hidden')}>
         <div className="tabs">
           {[['steer', t.tabSteer], ['once', t.tabOnce], ['probe', t.tabProbe],
-            ['data', t.tabData], ['gw', t.tabGateway]].map(([k, label]) => (
+            ['power', t.tabStrength], ['data', t.tabData], ['gw', t.tabGateway]].map(([k, label]) => (
             <button key={k} className={'tab' + (cockpitTab === k ? ' active' : '')}
-                    onClick={() => setCockpitTab(k)}>
+                    onClick={() => { setCockpitTab(k); if (k === 'power' && !strength) loadStrength() }}>
               {label}{k === 'once' && perReq.armed ? ' ●' : ''}
             </button>
           ))}
@@ -399,6 +409,9 @@ export default function App() {
             <h3 className="probe-h" style={{ color: '#ececec' }}>{t.probeTitle}</h3>
             <ArchPanel probe={probe} probing={probing} t={t} lang={lang} />
           </>
+        )}
+        {cockpitTab === 'power' && (
+          <StrengthPanel data={strength} onRefresh={loadStrength} steer={steer} onPatch={patchSteer} t={t} lang={lang} />
         )}
         {cockpitTab === 'data' && (
           <>

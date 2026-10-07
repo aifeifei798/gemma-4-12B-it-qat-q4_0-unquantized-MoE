@@ -153,6 +153,12 @@ class MyriadTrueRoutingLayer(nn.Module):
         self.steer_temp = 1.0
         self.steer_disabled_macros = []
         self.steer_disabled_clusters = []
+        # [GAIN] 运行时增益调制 (默认1.0恒等; 0=静音分支, >1=增强)
+        self.steer_gain_shared = 1.0
+        self.steer_gain_macro = 1.0
+        self.steer_gain_micro = 1.0
+        self.steer_gain_cores = [1.0] * 8
+        self.steer_gain_clusters = [1.0] * 16
         self.reset_parameters()
 
     def reset_parameters(self):
@@ -184,12 +190,26 @@ class MyriadTrueRoutingLayer(nn.Module):
         _off_shared = bool(getattr(self, "steer_disable_shared", False))
         _off_macro = bool(getattr(self, "steer_disable_macro", False))
         _off_micro = bool(getattr(self, "steer_disable_micro", False))
+        # [GAIN] 增益 (None/非法->1.0; 服务端已钳0~3)
+        def _g1(v):
+            try:
+                return float(v)
+            except Exception:
+                return 1.0
+        _gs = _g1(getattr(self, "steer_gain_shared", 1.0))
+        _gm = _g1(getattr(self, "steer_gain_macro", 1.0))
+        _gu = _g1(getattr(self, "steer_gain_micro", 1.0))
+        _gc = list(getattr(self, "steer_gain_cores", []) or []) + [1.0] * 8
+        _gu_c = list(getattr(self, "steer_gain_clusters", []) or []) + [1.0] * 16
+        _gc = [_g1(v) for v in _gc[:8]]
+        _gu_c = [_g1(v) for v in _gu_c[:16]]
 
         # 1. 共享主宰
         if _off_shared:
             shared_out = torch.zeros(N, D, device=x_flat.device, dtype=self.shared_lora_B.weight.dtype)
         else:
             shared_out = self.scale_shared * self.shared_lora_B(self.shared_lora_A(x_flat))
+        shared_out = shared_out * _gs
 
         # 2. 八大天王宏观路由 (8 选 2)
         if _off_macro:
@@ -198,9 +218,11 @@ class MyriadTrueRoutingLayer(nn.Module):
         else:
             w_macro, _, aux_macro = self.router_macro(x_flat)  # [N, 8]
             h_macro = torch.matmul(x_flat, self.macro_lora_A)  # [N, 128]
+            _gct = torch.tensor(_gc, device=h_macro.device, dtype=h_macro.dtype).view(1, -1, 1)
             h_macro_weighted = (h_macro.view(N, self.num_macro_cores, self.macro_rank) *
-                                w_macro.unsqueeze(-1)).view(N, self.total_macro_rank)
+                                w_macro.unsqueeze(-1) * _gct).view(N, self.total_macro_rank)
             macro_out = self.scale_macro * torch.matmul(h_macro_weighted, self.macro_lora_B)
+            macro_out = macro_out * _gm
 
         # 3. 满血微专家条件独立动态路由
         if _off_macro:
@@ -229,7 +251,9 @@ class MyriadTrueRoutingLayer(nn.Module):
             topk_micro_w = topk_micro_vals / (topk_micro_vals.sum(dim=-1, keepdim=True) + 1e-8)
 
             local_sparse_w = torch.zeros_like(micro_probs).scatter_(-1, topk_micro_idx, topk_micro_w)
-            w_joint = w_cluster.unsqueeze(-1) * local_sparse_w  # [N, 16, 16]
+            _gut = torch.tensor(_gu_c, device=w_cluster.device,
+                                dtype=w_cluster.dtype).view(1, -1, 1)
+            w_joint = w_cluster.unsqueeze(-1) * local_sparse_w * _gut  # [N, 16, 16]
 
             h_micro = torch.matmul(x_flat, self.micro_lora_A)  # [N, 4096]
             # [R5] view+broadcast免repeat: 省一半临时显存, 数学等价 ((w*h)@B == w*(h@B))
@@ -238,6 +262,7 @@ class MyriadTrueRoutingLayer(nn.Module):
                 * w_joint.unsqueeze(-1)
             ).view(N, self.total_micro_rank)
             micro_out = self.scale_micro * torch.matmul(h_micro_sparse, self.micro_lora_B)
+            micro_out = micro_out * _gu
 
             # [R4] micro aux: 每个宗门独立Switch损失再平均, 与macro/cluster同量级(均匀~1.0)
             # 宗门c内: density_c(e)=选中次数/(N*2), p_c(e)=mean probs, aux_c=E*Σd*p; aux_micro=mean_c aux_c

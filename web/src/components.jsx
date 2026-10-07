@@ -67,14 +67,14 @@ export function Md({ text }) {
   )
 }
 
-export function Bar({ label, value, max = 1, color = '#19c37d' }) {
+export function Bar({ label, value, max = 1, color = '#19c37d', text = null }) {
   return (
     <div className="bar-row">
       <div className="bar-label">{label}</div>
       <div className="bar-track">
         <div className="bar-fill" style={{ width: `${Math.min(100, (value / max) * 100)}%`, background: color }} />
       </div>
-      <div className="bar-val">{(value * 100).toFixed(1)}%</div>
+      <div className="bar-val">{text ?? `${(value * 100).toFixed(1)}%`}</div>
     </div>
   )
 }
@@ -246,6 +246,97 @@ export function GatewayPanel({ t }) {
         </div>
       ))}
       <div className="row" style={{ lineHeight: 1.7 }}>{t.gwNote}</div>
+    </div>
+  )
+}
+
+export function StrengthPanel({ data, onRefresh, steer, onPatch, t, lang }) {
+  const gv = (k, i) => {
+    const v = steer?.[k]
+    if (i === undefined) return (typeof v === 'number' ? v : 1.0)
+    return (Array.isArray(v) && typeof v[i] === 'number') ? v[i] : 1.0
+  }
+  const setArr = (k, n, i, v) => {
+    const cur = Array.isArray(steer?.[k]) ? [...steer[k]] : []
+    while (cur.length < n) cur.push(1.0)
+    cur[i] = v
+    onPatch({ [k]: cur })
+  }
+  const slider = (val, fn) => (
+    <input type="range" min="0" max="2" step="0.05" value={val}
+           onChange={e => fn(parseFloat(e.target.value))}
+           style={{ width: 120, verticalAlign: 'middle' }} />
+  )
+  const glabel = (c, g) => `${c}${g !== 1 ? ` ×${Number(g).toFixed(2).replace(/0$/, '')}` : ''}`
+  if (!data) return (
+    <div className="panel">
+      <h3>💪 {t.strengthTitle}</h3>
+      <div className="row">{t.strengthHint}</div>
+      <button className="tgl" onClick={onRefresh}>{t.strengthLoad}</button>
+    </div>
+  )
+  const cMax = Math.max(...data.cores.map(c => c.strength), 0.01)
+  const uMax = Math.max(...data.clusters.map(c => c.strength), 0.01)
+  const lMax = Math.max(...data.layers.flatMap(l => [l.shared, l.macro, l.micro]), 0.01)
+  const cname = c => `${c.id}·${lang === 'en' ? c.en : c.name.replace(c.en, '')}`
+  return (
+    <div className="panel">
+      <h3>💪 {t.strengthTitle}
+        <button className="tgl" onClick={onRefresh} style={{ marginLeft: 8 }}>↻</button>
+      </h3>
+      <div className="row">{t.strengthHint}</div>
+      <h3 className="probe-h">🎚 {t.gainTitle}
+        <button className="tgl" onClick={() => onPatch({
+          gain_shared: 1.0, gain_macro: 1.0, gain_micro: 1.0,
+          gain_cores: [1, 1, 1, 1, 1, 1, 1, 1],
+          gain_clusters: [1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
+        })} style={{ marginLeft: 8 }}>{t.gainReset}</button>
+      </h3>
+      {[['gain_shared', 'shared'], ['gain_macro', 'macro'], ['gain_micro', 'micro']].map(([k, label]) => (
+        <div key={k} className="bar-row">
+          <div className="bar-label">{label} ×{Number(gv(k)).toFixed(2)}</div>
+          <div className="bar-track" style={{ background: 'transparent' }}>
+            {slider(gv(k), v => onPatch({ [k]: v }))}
+          </div>
+        </div>
+      ))}
+      <h3 className="probe-h">{t.gainCores}</h3>
+      {data.cores.map(c => (
+        <div key={c.id} className="bar-row">
+          <div className="bar-label">{cname(c)}</div>
+          <div className="bar-track" style={{ background: 'transparent' }}>
+            {slider(gv('gain_cores', c.id), v => setArr('gain_cores', 8, c.id, v))}
+          </div>
+          <div className="bar-val">×{Number(gv('gain_cores', c.id)).toFixed(2)}</div>
+        </div>
+      ))}
+      <h3 className="probe-h">{t.gainClans}</h3>
+      {data.clusters.map(c => (
+        <div key={c.id} className="bar-row">
+          <div className="bar-label">{`${c.id}·${lang === 'en' ? c.en : c.name}`}</div>
+          <div className="bar-track" style={{ background: 'transparent' }}>
+            {slider(gv('gain_clusters', c.id), v => setArr('gain_clusters', 16, c.id, v))}
+          </div>
+          <div className="bar-val">×{Number(gv('gain_clusters', c.id)).toFixed(2)}</div>
+        </div>
+      ))}
+      <h3 className="probe-h">{t.strengthCores}</h3>
+      {data.cores.map(c => (
+        <Bar key={c.id} label={glabel(cname(c), gv('gain_cores', c.id))} value={c.strength} max={cMax} color="#19c37d" text={c.strength.toFixed(2)} />
+      ))}
+      <h3 className="probe-h">{t.strengthClans}</h3>
+      {data.clusters.map(c => (
+        <Bar key={c.id} label={glabel(`${c.id}·${lang === 'en' ? c.en : c.name}`, gv('gain_clusters', c.id))} value={c.strength} max={uMax} color="#7cc4ff" text={c.strength.toFixed(2)} />
+      ))}
+      <h3 className="probe-h">{t.strengthLayers}</h3>
+      {data.layers.map(l => (
+        <div key={l.layer} style={{ marginBottom: 6 }}>
+          <div className="row" style={{ margin: '2px 0' }}>L{l.layer}</div>
+          <Bar label="shared" value={l.shared} max={lMax} color="#b18cff" text={l.shared.toFixed(2)} />
+          <Bar label="macro" value={l.macro} max={lMax} color="#19c37d" text={l.macro.toFixed(2)} />
+          <Bar label="micro" value={l.micro} max={lMax} color="#7cc4ff" text={l.micro.toFixed(2)} />
+        </div>
+      ))}
     </div>
   )
 }

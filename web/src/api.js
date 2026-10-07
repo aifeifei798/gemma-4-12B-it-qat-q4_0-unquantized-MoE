@@ -116,3 +116,7 @@ export async function analyzeIntent(prompt) {
 export async function fetchDomains() {
   return (await fetch('/api/domains')).json()
 }
+
+export async function fetchStrength() {
+  return (await fetch('/api/strength')).json()
+}

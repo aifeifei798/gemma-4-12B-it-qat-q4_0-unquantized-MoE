@@ -28,6 +28,7 @@ adapters, and a hot-swappable patch workflow. Includes a FastAPI backend and a
 pnpm (Vite + React) chat UI with a live routing probe.
 
 ![Chat](images/ui-chat.png)
+![Power](images/ui-power.png)
 ![Home](images/ui-hero.png)
 
 ## Architecture
@@ -126,7 +127,11 @@ v3 result (5205 steps, 3 epochs): **val macro Top-1 66.2 %** (chance 12.5 %),
 - Cockpit tabs: Steer (global) / Once (one-shot per-request overrides:
   temperature, pin macro, kill lists, branch switches, max tokens,
   prefix shortcuts — auto-cleared after send) / Probe (intent tester +
-  full diagnostics) / Data (VRAM, context cap, hot-swap, bad-case list)
+  full diagnostics) / Power (`GET /api/strength`: per-core/per-clan B-norms
+  averaged over 12 layers + per-layer branches; static capacity view; the
+  same tab hosts a live gain mixer — branch/core/clan multipliers 0–2,
+  `gain_*` in global steering and per-request overrides, defaults 1.0) /
+  Data (VRAM, context cap, hot-swap, bad-case list)
   / Link (OpenAI-compatible connection info for Cherry Studio etc.).
 
 ## Micro-patch workflow (`4.micro_patch.py`, `poetry_patch.jsonl`)
