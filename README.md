@@ -9,7 +9,7 @@ A hierarchical Mixture-of-Experts grafted onto a frozen **Gemma-4-12B** backbone
 
 Includes full data preparation, training recipes, a FastAPI inference engine with SSE streaming, and a Vite + React chat console with real-time routing probes.
 
-> **Note**: Model weights (`*.pt`) and quantized base models live on 🤗 Hugging Face and must be acquired separately.
+> **Note**: Model weights (`*.pt`) and quantized base models live on see [🤗 Hugging Face]((https://huggingface.co/aifeifei798/gemma-4-12B-it-qat-q4_0-unquantized-MoE))  and must be acquired separately.
 
 ---
 
