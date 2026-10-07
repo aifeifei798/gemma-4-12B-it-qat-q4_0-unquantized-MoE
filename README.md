@@ -6,6 +6,8 @@ micro-experts**, trained with supervised domain routing, 4-bit QLoRA-style
 adapters, and a hot-swappable patch workflow. Includes a FastAPI backend and a
 pnpm (Vite + React) chat UI with a live routing probe.
 
+![My Project Screenshot](https://github.com/aifeifei798/gemma-4-12B-it-qat-q4_0-unquantized-MoE/blob/main/images/2026-10-07_11-46.png)
+
 ## Architecture
 
 MoE adapters are grafted onto layers **18–29** (12 layers, **405.1M**
