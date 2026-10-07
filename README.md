@@ -114,3 +114,51 @@ python3 4.micro_patch.py --data poetry_patch.jsonl --out myriad_moe_patch_poetry
 curl -X POST localhost:8000/api/hotswap -H 'Content-Type: application/json' \
   -d '{"weight":"myriad_moe_patch_poetry.pt"}'
 ```
+
+## Public Prior Art & Disclosures
+
+Prepared to support prior-art searches. This is a technical record, not
+legal advice.
+
+### A. Public prior art this work builds on
+
+- **LoRA** (Hu et al., 2021, arXiv:2106.09685) — low-rank adapters on frozen
+  weights; this repo uses the same `alpha/r` scaling convention.
+- **Switch Transformer** (Fedus et al., 2021, arXiv:2101.03961) — Top-K
+  sparse gating with the `density × p_mean` load-balance auxiliary loss,
+  reused here on all three routing levels.
+- **LLM.int8()** (Dettmers et al., 2022, arXiv:2208.07339) — 8-bit
+  mixed-precision decomposition for serving/training large models.
+- **QLoRA** (Dettmers et al., 2023, arXiv:2305.14314) — 4-bit NF4 frozen
+  base + bf16 adapters; this repo's training setup.
+- **DeepSeekMoE** (Dai et al., 2024) and **DeepSeek-V3** (Liu et al., 2024)
+  — fine-grained expert segmentation with shared experts; the conceptual
+  basis for the shared-sovereign + fine-grained-micro-expert hierarchy here.
+- **Gemma family** (Google) — the frozen 12B backbone and tokenizer.
+- Standard tooling: gradient checkpointing, AdamW (incl. 8-bit paged
+  variants via bitsandbytes), cosine schedules with warmup, FastAPI + SSE
+  streaming, Vite + React frontends.
+
+### B. What this repository publicly discloses
+
+To the best of our knowledge the following combination, as implemented in
+this repo's commit history, was not previously published as a whole:
+
+1. Three-level conditional routing (`Top-2 of 8` macro × `Top-2 of 16`
+   clans × per-clan `Top-2 of 16` micro-experts) with the joint weight
+   `P(clan) · P(expert | clan)` computed in low-rank space.
+2. Response-token-only supervised routing (`core_id`/`cluster_id` CE) to
+   avoid contradictory labels from domain-shared prompt templates.
+3. Per-clan Switch-style micro auxiliary loss (averaged, same scale as the
+   macro/clan terms) instead of a flat mean-squared uniformity term.
+4. Sequence-chunked fine-tuning (≤256 tokens, 1-token overlap, exact LM/sup
+   equivalence) as a mitigation for display-watchdog (`Xid 8`) kills on
+   desktop GPUs.
+5. Single-function warmup+cosine scheduler (`LambdaLR`) chosen after
+   observing frozen learning rates when resuming multi-scheduler
+   (`SequentialLR`) state.
+6. Live weight hot-swap (`POST /api/hotswap` under a model mutex) fed by
+   targeted micro-fine-tunes, with a routing probe (macro/clan histograms,
+   branch energies, per-token Top-2) as the acceptance check.
+
+Corrections to dates, attributions, or IDs above are welcome via issues/PRs.
