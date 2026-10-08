@@ -3,7 +3,7 @@ import { streamChat, fetchProbe, fetchHealth, hotswap, getSteering, setSteering,
          gpuClear, markBadcase, fetchDomains, fetchBadcases, uploadFile,
          fetchStrength } from './api.js'
 import { ArchPanel, SteeringPanel, MetaBadge, Md, PerReqPanel, IntentBox,
-         BadcasePanel, GatewayPanel, StrengthPanel } from './components.jsx'
+         BadcasePanel, GatewayPanel, StrengthPanel, PatchPanel } from './components.jsx'
 import { STR } from './i18n.js'
 import './styles.css'
 
@@ -378,7 +378,8 @@ export default function App() {
       <aside className={'cockpit' + (cockpit ? '' : ' hidden')}>
         <div className="tabs">
           {[['steer', t.tabSteer], ['once', t.tabOnce], ['probe', t.tabProbe],
-            ['power', t.tabStrength], ['data', t.tabData], ['gw', t.tabGateway]].map(([k, label]) => (
+            ['power', t.tabStrength], ['patch', t.tabPatch],
+            ['data', t.tabData], ['gw', t.tabGateway]].map(([k, label]) => (
             <button key={k} className={'tab' + (cockpitTab === k ? ' active' : '')}
                     onClick={() => { setCockpitTab(k); if (k === 'power' && !strength) loadStrength() }}>
               {label}{k === 'once' && perReq.armed ? ' ●' : ''}
@@ -412,6 +413,9 @@ export default function App() {
         )}
         {cockpitTab === 'power' && (
           <StrengthPanel data={strength} onRefresh={loadStrength} steer={steer} onPatch={patchSteer} t={t} lang={lang} />
+        )}
+        {cockpitTab === 'patch' && (
+          <PatchPanel t={t} />
         )}
         {cockpitTab === 'data' && (
           <>

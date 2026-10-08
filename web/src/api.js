@@ -120,3 +120,32 @@ export async function fetchDomains() {
 export async function fetchStrength() {
   return (await fetch('/api/strength')).json()
 }
+
+export async function uploadPatch(file) {
+  const fd = new FormData()
+  fd.append('file', file)
+  const res = await fetch('/api/patches/upload', { method: 'POST', body: fd })
+  return res.json()
+}
+
+export async function fetchPatches() {
+  return (await fetch('/api/patches')).json()
+}
+
+export async function applyPatch(name) {
+  const res = await fetch('/api/patches/apply', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name }),
+  })
+  return res.json()
+}
+
+export async function unloadPatch(name) {
+  const res = await fetch('/api/patches/unload', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: name || '' }),
+  })
+  return res.json()
+}

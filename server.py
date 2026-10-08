@@ -56,6 +56,12 @@ IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 AUD_EXTS = {".wav", ".mp3", ".ogg", ".flac", ".m4a", ".opus"}
 VID_EXTS = {".mp4", ".mov", ".webm", ".avi", ".mkv"}
 MAX_UPLOAD_MB = 50
+
+# ---- 托管式补丁 (Patch tab用; raw /api/hotswap 不进栈, 不可卸载) ----
+PATCH_DIR = os.path.join(BASE, "patches")
+os.makedirs(PATCH_DIR, exist_ok=True)
+MAX_PATCH_MB = 2048
+PATCH_STACK = []  # [{name, scope, snapshot}] LIFO; 快照在合入前抓, 卸载时盖回
 # 遥测透传白名单: 只带与prompt对齐的多模态张量 (mask类与response拼接错位, 不带)
 MM_TELEMETRY_KEYS = ("pixel_values", "image_position_ids",
                      "input_features", "input_features_mask")
@@ -303,25 +309,31 @@ def build_mm_inputs(history, prompt_text, file_ids):
     return out
 
 
+def _refresh_b_norms():
+    """各层B范数重算 (hotswap/apply/unload后调用)."""
+    global B_NORMS
+    with torch.no_grad():
+        B_NORMS = [{
+            "layer": 18 + i,
+            "shared": w.shared_lora_B.weight.detach().float().norm().item(),
+            "macro": w.macro_lora_B.detach().float().norm().item(),
+            "micro": w.micro_lora_B.detach().float().norm().item(),
+        } for i, w in enumerate(WRAPPERS)]
+
+
 def _do_hotswap(weight):
     """热插拔实装 (/api/hotswap 与 /admin/reload-weights 共用)."""
     import time
-    global B_NORMS
     if not weight or not os.path.isfile(weight):
         return None, f"权重文件不存在: {weight}"
     fp = weight if os.path.isabs(weight) else os.path.join(BASE, weight)
     t0 = time.time()
     with _MODEL_LOCK:
         sd = torch.load(fp, map_location="cpu", weights_only=False)
-        trainmod.load_weights_dict(WRAPPERS, 18, sd)
-        with torch.no_grad():
-            B_NORMS = [{
-                "layer": 18 + i,
-                "shared": w.shared_lora_B.weight.detach().float().norm().item(),
-                "macro": w.macro_lora_B.detach().float().norm().item(),
-                "micro": w.micro_lora_B.detach().float().norm().item(),
-            } for i, w in enumerate(WRAPPERS)]
-    return {"ok": True, "weight": weight, "secs": round(time.time() - t0, 1),
+        scope, n = trainmod.apply_patch_dict(WRAPPERS, 18, sd)
+        _refresh_b_norms()
+    return {"ok": True, "weight": weight, "scope": scope, "merged": n,
+            "secs": round(time.time() - t0, 1),
             "layers": len(WRAPPERS), "b_norms": B_NORMS}, None
 
 
@@ -512,6 +524,136 @@ def reload_weights(req: ReloadReq):
         return out
     except Exception as e:
         return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
+
+
+# ==========================================================
+# 托管式补丁 (Patch tab): 上传 -> 快照 -> 加载 -> 一键卸载 (LIFO)
+# ==========================================================
+def _patch_meta(name):
+    fp = os.path.join(PATCH_DIR, name)
+    meta = {"name": name, "size_mb": round(os.path.getsize(fp) / 1e6, 1)}
+    try:
+        with open(fp + ".json", encoding="utf-8") as f:
+            meta.update(json.load(f))
+    except Exception:
+        pass
+    return meta
+
+
+@app.get("/api/patches")
+def list_patches():
+    """已上传补丁 (读sidecar, 不碰.pt) + 已加载栈."""
+    files = sorted(f for f in os.listdir(PATCH_DIR) if f.endswith(".pt"))
+    return {"patches": [_patch_meta(f) for f in files],
+            "active": [{"name": e["name"], "scope": e["scope"]} for e in PATCH_STACK]}
+
+
+@app.post("/api/patches/upload")
+async def upload_patch(file: UploadFile = File(...)):
+    """补丁上传 (.pt, ≤2G): 落盘 + 读信封写sidecar (scope/clusters)."""
+    name = os.path.basename(file.filename or "")
+    if not re.fullmatch(r"[\w\-.]+", name) or not name.endswith(".pt"):
+        return JSONResponse({"error": f"非法文件名: {name!r} (仅字母数字/_-.且以.pt结尾)"},
+                            status_code=400)
+    fp = os.path.join(PATCH_DIR, name)
+    size = 0
+    try:
+        with open(fp, "wb") as f:
+            while True:
+                chunk = await file.read(8 * 1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > MAX_PATCH_MB * 1024 * 1024:
+                    f.close()
+                    os.path.exists(fp) and os.remove(fp)
+                    return JSONResponse({"error": f"超限{MAX_PATCH_MB}MB"}, status_code=413)
+                f.write(chunk)
+    except Exception as e:
+        os.path.exists(fp) and os.remove(fp)
+        return JSONResponse({"error": f"写入失败: {e}"}, status_code=500)
+    try:  # 读信封定scope, 失败则删文件 (不是补丁)
+        sd = torch.load(fp, map_location="cpu", weights_only=False)
+        scope, clusters = trainmod._patch_regions(None, 18, sd)
+        del sd
+        gc.collect()
+    except Exception as e:
+        os.path.exists(fp) and os.remove(fp)
+        return JSONResponse({"error": f"不是有效补丁文件: {e}"}, status_code=400)
+    sidecar = {"scope": scope, "clusters": clusters,
+               "mtime": os.path.getmtime(fp)}
+    with open(fp + ".json", "w", encoding="utf-8") as f:
+        json.dump(sidecar, f)
+    return {"ok": True, **_patch_meta(name)}
+
+
+class PatchApplyReq(BaseModel):
+    name: str = ""
+
+    @field_validator("name", mode="before")
+    @classmethod
+    def _s(cls, v):
+        return str(v) if v is not None else ""
+
+
+@app.post("/api/patches/apply")
+def apply_patch(req: PatchApplyReq):
+    """一键加载: 先抓覆盖区快照 (CPU) 再合入, 进栈可卸载."""
+    if MODEL is None:
+        return JSONResponse({"error": "模型未就绪"}, status_code=503)
+    import time
+    name = os.path.basename(req.name or "")
+    fp = os.path.join(PATCH_DIR, name)
+    if not name.endswith(".pt") or not os.path.isfile(fp):
+        return JSONResponse({"error": f"补丁不存在: {name}"}, status_code=404)
+    t0 = time.time()
+    try:
+        with _MODEL_LOCK:
+            sd = torch.load(fp, map_location="cpu", weights_only=False)
+            snap = trainmod.snapshot_patch_region(WRAPPERS, 18, sd)
+            try:
+                scope, n = trainmod.apply_patch_dict(WRAPPERS, 18, sd)
+            except Exception:
+                trainmod.restore_snapshot(WRAPPERS, 18, snap)  # 中途失败自动回滚
+                raise
+            del sd
+            gc.collect()
+            PATCH_STACK.append({"name": name, "scope": scope, "snapshot": snap})
+            _refresh_b_norms()
+    except Exception as e:
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
+    return {"ok": True, "name": name, "scope": scope, "merged": n,
+            "secs": round(time.time() - t0, 1),
+            "active": [e["name"] for e in PATCH_STACK], "b_norms": B_NORMS}
+
+
+@app.post("/api/patches/unload")
+def unload_patch(req: PatchApplyReq):
+    """一键卸载: LIFO弹出栈顶并盖回快照. name不给=卸最近一个;
+    指定name但不在栈顶则拒绝 (先卸上层, 防切片错位)."""
+    if MODEL is None:
+        return JSONResponse({"error": "模型未就绪"}, status_code=503)
+    import time
+    if not PATCH_STACK:
+        return JSONResponse({"error": "没有已加载的补丁"}, status_code=404)
+    name = os.path.basename(req.name or "")
+    if name and PATCH_STACK[-1]["name"] != name:
+        loaded = [e["name"] for e in PATCH_STACK]
+        if name not in loaded:
+            return JSONResponse({"error": f"补丁未加载: {name}"}, status_code=404)
+        return JSONResponse(
+            {"error": f"{name} 不是栈顶, 先卸 {PATCH_STACK[-1]['name']}"}, status_code=409)
+    t0 = time.time()
+    try:
+        with _MODEL_LOCK:
+            top = PATCH_STACK.pop()
+            n = trainmod.restore_snapshot(WRAPPERS, 18, top["snapshot"])
+            _refresh_b_norms()
+    except Exception as e:
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=500)
+    return {"ok": True, "name": top["name"], "scope": top["scope"],
+            "restored": n, "secs": round(time.time() - t0, 1),
+            "active": [e["name"] for e in PATCH_STACK], "b_norms": B_NORMS}
 
 
 @app.post("/admin/gpu-clear")

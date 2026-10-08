@@ -374,6 +374,177 @@ def load_weights_dict(trainable_wrappers, start_layer, state_dict, dtype=None, d
 
 
 # ==========================================================
+# 4c. 增量补丁合并 (4a/4b拆分补丁用; 旧全量文件走load_weights_dict)
+# 补丁信封: {"scope": "macro"|"micro", "clusters": [...],
+#            "base": "v3", "weights": {...}}
+# macro包/层: layer_{i}_macro_lora_A/B + layer_{i}_router_macro (~2MB/层)
+# micro包/层/宗门c: layer_{i}_micro_clan_{c}_A/B (列/行切片)
+#            + layer_{i}_router_micro_clan_{c} (行切片)
+#            + layer_{i}_router_cluster (整表, 每层61k可忽略)
+# 切片几何从wrapper属性推导, 不硬编码 (per_clan_rank=256, rows=16)。
+# ==========================================================
+def _clan_slices(w, c):
+    per_rank = w.experts_per_cluster * w.micro_rank  # 每宗门micro列宽 (16*16=256)
+    per_row = w.experts_per_cluster                  # 每宗门router_micro行数 (16)
+    c = int(c)
+    return c * per_rank, (c + 1) * per_rank, c * per_row, (c + 1) * per_row
+
+
+def apply_patch_dict(trainable_wrappers, start_layer, patch, dtype=None, device=None):
+    """热插拔合并: 旧全量原样覆写; 新信封按scope切片合并 (多补丁可 sequential 叠加).
+    返回 (scope, merged_keys) 供日志."""
+    if isinstance(patch, dict) and "weights" in patch and "scope" in patch:
+        scope, clusters, wd = patch["scope"], patch.get("clusters") or [], patch["weights"]
+    elif (isinstance(patch, dict) and any(k.endswith("_macro_lora_A") for k in patch)
+            and not any(k.endswith(("_micro_lora_A", "_shared_lora_A")) for k in patch)):
+        scope, clusters, wd = "macro", [], patch  # 裸macro包 (无信封的旧写法)
+    else:  # 旧全量 (4.micro_patch.py产物)
+        load_weights_dict(trainable_wrappers, start_layer, patch, dtype=dtype, device=device)
+        return "full", len(patch)
+    n = 0
+    for i, w in enumerate(trainable_wrappers):
+        idx = start_layer + i
+        dev, dt = _infer_wrapper_device_dtype(w, dtype or torch.bfloat16)
+        if device is not None:
+            dev = torch.device(device)
+        if dtype is not None:
+            dt = dtype
+        if scope == "macro":
+            a, b = f"layer_{idx}_macro_lora_A", f"layer_{idx}_macro_lora_B"
+            if a in wd:
+                w.macro_lora_A.data.copy_(wd[a].to(dev, dtype=dt)); n += 1
+            if b in wd:
+                w.macro_lora_B.data.copy_(wd[b].to(dev, dtype=dt)); n += 1
+            rk = f"layer_{idx}_router_macro"
+            if rk in wd:
+                w.router_macro.router.load_state_dict(
+                    {k: v.to(dev, dtype=dt) for k, v in wd[rk].items()}); n += 1
+        elif scope == "micro":
+            rk = f"layer_{idx}_router_cluster"
+            if rk in wd:
+                w.router_cluster.router.load_state_dict(
+                    {k: v.to(dev, dtype=dt) for k, v in wd[rk].items()}); n += 1
+            for c in clusters:
+                s0, s1, r0, r1 = _clan_slices(w, c)
+                ak = f"layer_{idx}_micro_clan_{c}_A"
+                bk = f"layer_{idx}_micro_clan_{c}_B"
+                mk = f"layer_{idx}_router_micro_clan_{c}"
+                if ak in wd:
+                    w.micro_lora_A.data[:, s0:s1].copy_(wd[ak].to(dev, dtype=dt)); n += 1
+                if bk in wd:
+                    w.micro_lora_B.data[s0:s1, :].copy_(wd[bk].to(dev, dtype=dt)); n += 1
+                if mk in wd:
+                    w.router_micro.weight.data[r0:r1, :].copy_(wd[mk].to(dev, dtype=dt)); n += 1
+        else:
+            raise ValueError(f"未知补丁scope: {scope}")
+    return scope, n
+
+
+def _patch_regions(wrappers, start_layer, patch):
+    """算补丁覆盖的键 (与apply_patch_dict同口径), 供快照/恢复用.
+    返回 (scope, clusters, per_layer_keyfn) 其中keyfn(w, idx)产出 (kind, key, getter, setter)."""
+    if isinstance(patch, dict) and "weights" in patch and "scope" in patch:
+        scope, clusters = patch["scope"], [int(c) for c in (patch.get("clusters") or [])]
+    elif (isinstance(patch, dict) and any(k.endswith("_macro_lora_A") for k in patch)
+            and not any(k.endswith(("_micro_lora_A", "_shared_lora_A")) for k in patch)):
+        scope, clusters = "macro", []
+    else:
+        scope, clusters = "full", []
+    return scope, clusters
+
+
+def snapshot_patch_region(trainable_wrappers, start_layer, patch):
+    """抓补丁覆盖区的CPU快照 (卸载时原样盖回). micro按宗门切片抓, 很小;
+    macro约24MB; 全量约810MB."""
+    scope, clusters = _patch_regions(trainable_wrappers, start_layer, patch)
+    snap = {"_scope": scope, "_clusters": clusters}
+    for i, w in enumerate(trainable_wrappers):
+        idx = start_layer + i
+        if scope in ("macro", "full"):
+            snap[f"layer_{idx}_macro_lora_A"] = w.macro_lora_A.data.cpu().clone()
+            snap[f"layer_{idx}_macro_lora_B"] = w.macro_lora_B.data.cpu().clone()
+            snap[f"layer_{idx}_router_macro"] = {
+                k: v.cpu().clone() for k, v in w.router_macro.router.state_dict().items()}
+        if scope == "micro":
+            snap[f"layer_{idx}_router_cluster"] = {
+                k: v.cpu().clone() for k, v in w.router_cluster.router.state_dict().items()}
+            for c in clusters:
+                s0, s1, r0, r1 = _clan_slices(w, c)
+                snap[f"layer_{idx}_micro_clan_{c}_A"] = w.micro_lora_A.data[:, s0:s1].cpu().clone()
+                snap[f"layer_{idx}_micro_clan_{c}_B"] = w.micro_lora_B.data[s0:s1, :].cpu().clone()
+                snap[f"layer_{idx}_router_micro_clan_{c}"] = \
+                    w.router_micro.weight.data[r0:r1, :].cpu().clone()
+        if scope == "full":
+            snap[f"layer_{idx}_shared_lora_A"] = {
+                k: v.cpu().clone() for k, v in w.shared_lora_A.state_dict().items()}
+            snap[f"layer_{idx}_shared_lora_B"] = {
+                k: v.cpu().clone() for k, v in w.shared_lora_B.state_dict().items()}
+            snap[f"layer_{idx}_router_cluster"] = {
+                k: v.cpu().clone() for k, v in w.router_cluster.router.state_dict().items()}
+            snap[f"layer_{idx}_router_micro"] = {
+                k: v.cpu().clone() for k, v in w.router_micro.state_dict().items()}
+            snap[f"layer_{idx}_micro_lora_A"] = w.micro_lora_A.data.cpu().clone()
+            snap[f"layer_{idx}_micro_lora_B"] = w.micro_lora_B.data.cpu().clone()
+    return snap
+
+
+def restore_snapshot(trainable_wrappers, start_layer, snap):
+    """快照盖回 (与apply_patch_dict同一切片几何). 返回恢复键数."""
+    scope, clusters = snap.get("_scope", "full"), snap.get("_clusters", [])
+    n = 0
+    for i, w in enumerate(trainable_wrappers):
+        idx = start_layer + i
+        dev, dt = _infer_wrapper_device_dtype(w, torch.bfloat16)
+        if scope in ("macro", "full"):
+            for k, ref in (("macro_lora_A", w.macro_lora_A),
+                           ("macro_lora_B", w.macro_lora_B)):
+                fk = f"layer_{idx}_{k}"
+                if fk in snap:
+                    ref.data.copy_(snap[fk].to(dev, dtype=dt)); n += 1
+            rk = f"layer_{idx}_router_macro"
+            if rk in snap:
+                w.router_macro.router.load_state_dict(
+                    {k: v.to(dev, dtype=dt) for k, v in snap[rk].items()}); n += 1
+        if scope == "micro":
+            rk = f"layer_{idx}_router_cluster"
+            if rk in snap:
+                w.router_cluster.router.load_state_dict(
+                    {k: v.to(dev, dtype=dt) for k, v in snap[rk].items()}); n += 1
+            for c in clusters:
+                s0, s1, r0, r1 = _clan_slices(w, c)
+                ak, bk, mk = (f"layer_{idx}_micro_clan_{c}_A",
+                              f"layer_{idx}_micro_clan_{c}_B",
+                              f"layer_{idx}_router_micro_clan_{c}")
+                if ak in snap:
+                    w.micro_lora_A.data[:, s0:s1].copy_(snap[ak].to(dev, dtype=dt)); n += 1
+                if bk in snap:
+                    w.micro_lora_B.data[s0:s1, :].copy_(snap[bk].to(dev, dtype=dt)); n += 1
+                if mk in snap:
+                    w.router_micro.weight.data[r0:r1, :].copy_(snap[mk].to(dev, dtype=dt)); n += 1
+        if scope == "full":
+            for lk, ref in (("shared_lora_A", w.shared_lora_A),
+                            ("shared_lora_B", w.shared_lora_B)):
+                fk = f"layer_{idx}_{lk}"
+                if fk in snap:
+                    ref.load_state_dict(
+                        {k: v.to(dev, dtype=dt) for k, v in snap[fk].items()}); n += 1
+            rk = f"layer_{idx}_router_cluster"
+            if rk in snap:
+                w.router_cluster.router.load_state_dict(
+                    {k: v.to(dev, dtype=dt) for k, v in snap[rk].items()}); n += 1
+            rk = f"layer_{idx}_router_micro"
+            if rk in snap:
+                w.router_micro.load_state_dict(
+                    {k: v.to(dev, dtype=dt) for k, v in snap[rk].items()}); n += 1
+            for lk, ref in (("micro_lora_A", w.micro_lora_A),
+                            ("micro_lora_B", w.micro_lora_B)):
+                fk = f"layer_{idx}_{lk}"
+                if fk in snap:
+                    ref.data.copy_(snap[fk].to(dev, dtype=dt)); n += 1
+    return n
+
+
+# ==========================================================
 # 4b. 分块前向/反向 (R6: 防显示看门狗Xid 8) + 异常抢救存盘
 # 背景: 训练卡同时带桌面时, S=448长序列的整批forward/backward burst
 #       可饿死显示通道触发RC watchdog (Xid 8, launch timed out)。

@@ -1,4 +1,4 @@
-import React from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 import ReactMarkdown from 'react-markdown'
 import remarkMath from 'remark-math'
 import rehypeKatex from 'rehype-katex'
@@ -6,6 +6,7 @@ import hljs from 'highlight.js'
 import 'highlight.js/styles/github-dark.css'
 import 'katex/dist/katex.min.css'
 import { CLAN_EN, coreName } from './i18n.js'
+import { uploadPatch, fetchPatches, applyPatch, unloadPatch } from './api.js'
 
 export function Md({ text }) {
   return (
@@ -246,6 +247,81 @@ export function GatewayPanel({ t }) {
         </div>
       ))}
       <div className="row" style={{ lineHeight: 1.7 }}>{t.gwNote}</div>
+    </div>
+  )
+}
+
+export function PatchPanel({ t }) {
+  const [list, setList] = useState({ patches: [], active: [] })
+  const [msg, setMsg] = useState('')
+  const [busy, setBusy] = useState(false)
+  const fileRef = useRef(null)
+  const load = async () => {
+    try { setList(await fetchPatches()) } catch (e) { setMsg(t.probeFail(e.message)) }
+  }
+  useEffect(() => { load() }, [])
+  const order = {}
+  ;(list.active || []).forEach((a, i) => { order[a.name] = i + 1 })
+  const top = (list.active || []).slice(-1)[0]
+  const badge = (p) => {
+    if (p.scope === 'macro') return '👑 macro'
+    if (p.scope === 'micro') return `🔬 micro · clans ${(p.clusters || []).join(',')}`
+    if (p.scope === 'full') return '📦 full'
+    return p.scope || '?'
+  }
+  const run = async (fn, startMsg, okMsg) => {
+    setBusy(true); setMsg(startMsg)
+    try {
+      const r = await fn()
+      setMsg(r.ok ? okMsg(r) : t.probeFail(r.error || JSON.stringify(r)))
+      if (r.ok) load()
+    } catch (e) { setMsg(t.probeFail(e.message)) }
+    setBusy(false)
+  }
+  return (
+    <div className="panel">
+      <h3>🩹 {t.patchTitle}
+        <button className="tgl" onClick={load} style={{ marginLeft: 8 }}>↻</button>
+      </h3>
+      <div className="row">{t.patchHint}</div>
+      <div className="row">
+        <input ref={fileRef} type="file" accept=".pt" style={{ display: 'none' }}
+               onChange={e => { const f = e.target.files?.[0]; e.target.value = ''; if (f) run(() => uploadPatch(f), t.patchUploading, t.patchUploaded) }} />
+        <button className="tgl" disabled={busy} onClick={() => fileRef.current?.click()}>
+          {t.patchUpload}
+        </button>
+      </div>
+      {(list.active || []).length > 0 && (
+        <div className="row" style={{ color: '#ececec' }}>
+          {t.patchActive}: {t.patchBase}
+          {(list.active || []).map(a => (
+            <span key={a.name}> → <code className="codebox">{a.name}</code></span>
+          ))}
+        </div>
+      )}
+      {(list.patches || []).length === 0 && <div className="row">{t.patchNone}</div>}
+      {(list.patches || []).map(p => (
+        <div key={p.name} className="row" style={{ borderTop: '1px solid #333', paddingTop: 6 }}>
+          <div style={{ color: '#ececec', overflowWrap: 'anywhere' }}>
+            {order[p.name] ? `#${order[p.name]} ` : ''}{p.name}
+          </div>
+          <div>{badge(p)} · {p.size_mb}MB</div>
+          <div>
+            {!order[p.name] && (
+              <button className="tgl" disabled={busy} onClick={() => run(() => applyPatch(p.name), t.patchApplying, t.patchApplied)}>
+                {t.patchLoad}
+              </button>
+            )}
+            {order[p.name] && (
+              <button className="tgl" disabled={busy || top?.name !== p.name}
+                      title={top?.name !== p.name ? t.patchLifo : ''} onClick={() => run(() => unloadPatch(top.name), t.patchUnloading, t.patchUnloaded)}>
+                {t.patchUnload}{top?.name !== p.name ? ` (${t.patchLifoShort})` : ''}
+              </button>
+            )}
+          </div>
+        </div>
+      ))}
+      {msg && <div className="row" style={{ color: '#7cc4ff' }}>{msg}</div>}
     </div>
   )
 }

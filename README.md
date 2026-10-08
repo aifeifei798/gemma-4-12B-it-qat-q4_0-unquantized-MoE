@@ -33,9 +33,11 @@ routing, 4-bit QLoRA-style adapters, and a hot-swappable patch workflow.
 Ships with a FastAPI backend and a pnpm (Vite + React) chat UI with a live
 routing probe.
 
-![Chat](images/ui-chat.png)
-![Power](images/ui-power.png)
-![Home](images/ui-hero.png)
+![Chat + steering cockpit](images/ui-chat.png)
+![Routing probe: macro/clan histograms + branch energy](images/ui-probe.png)
+![Power: gain mixer + expert strength](images/ui-power.png)
+![Patch manager: upload → load → unload](images/ui-patch.png)
+![Chinese UI + routing badges](images/ui-chat-zh.png)
 
 ## Architecture
 
@@ -150,6 +152,20 @@ Targeted hotfix without full retraining, demonstrated on a real failure
 3. Verify offline (`--weight patch`), then `POST /api/hotswap` — 0.6 s,
    zero downtime, quicksort regression-checked.
 
+Split patches (small files, stackable): `4a.macro_patch.py` trains only the
+macro branch (~24 MB) for routing-feel fixes; `4b.micro_patch.py` trains only
+the target clans' micro slices (~50 MB/clan, `--clusters 4,5`, auto-detected
+from data) with other slices grad-masked frozen. `POST /api/hotswap` merges
+either scope by slice (old full files still overwrite); shared stays frozen
+in both. `4.micro_patch.py` remains as the full-fallback.
+
+Managed patches live in the web **Patch** tab: `POST /api/patches/upload`
+(.pt, ≤2G, scope auto-detected into a sidecar), `GET /api/patches` (list +
+loaded stack), `POST /api/patches/apply` (CPU snapshot of covered regions,
+then slice-merge — a failed apply auto-rolls back), `POST
+/api/patches/unload` (LIFO pop restoring the snapshot). Stacks compose:
+base v3 → macro → clan(s). Raw `/api/hotswap` stays unmanaged (no unload).
+
 ## Repo layout
 
 ```
@@ -157,7 +173,10 @@ Targeted hotfix without full retraining, demonstrated on a real failure
 1.prepare_myriad_v3.py     # v3 pipeline: dedicated sources + Chinese + refusals
 2.train_myriad_v2_24g_safe.py  # training (DATA_TAG=v3)
 3.infer_probe.py           # inference + routing probe
-4.micro_patch.py           # targeted micro-fine-tune
+4.micro_patch.py           # targeted micro-fine-tune (full fallback)
+4.patch_lib.py             # shared patch plumbing (data/system/loop, not run directly)
+4a.macro_patch.py          # macro-only patch (~24MB)
+4b.micro_patch.py          # clan-slice micro patch (~50MB/clan)
 poetry_patch.jsonl         # example patch data
 domains.yaml               # single source of truth for core/clan names
 server.py                  # FastAPI backend
