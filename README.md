@@ -21,11 +21,17 @@ library_name: pytorch
 
 # Myriad-MoE: Hierarchical Fine-Grained MoE on Gemma-4-12B
 
-A hierarchical Mixture-of-Experts grafted onto a frozen **Gemma-4-12B** backbone
-(48 layers, hidden 3840): **1 shared sovereign + 8 macro cores + 16 clans × 16
-micro-experts**, trained with supervised domain routing, 4-bit QLoRA-style
-adapters, and a hot-swappable patch workflow. Includes a FastAPI backend and a
-pnpm (Vite + React) chat UI with a live routing probe.
+Inspired by the **big.LITTLE architecture** in phone SoCs — a few big cores
+for heavy lifting, many LITTLE cores for efficient background work, and a
+scheduler that migrates tasks by demand — Myriad-MoE applies the same idea
+to LLM adapters. Grafted onto a frozen **Gemma-4-12B** backbone (48 layers,
+hidden 3840): **8 big macro cores** (Rank-16, Top-2 routed) take domain-level
+work, **16 clans × 16 LITTLE micro-experts** absorb fine-grained load, and
+**1 always-on shared core** holds global context like a system housekeeping
+core. Learned routers play scheduler; training uses supervised domain
+routing, 4-bit QLoRA-style adapters, and a hot-swappable patch workflow.
+Ships with a FastAPI backend and a pnpm (Vite + React) chat UI with a live
+routing probe.
 
 ![Chat](images/ui-chat.png)
 ![Power](images/ui-power.png)
